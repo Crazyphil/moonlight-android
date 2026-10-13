@@ -19,16 +19,16 @@ import com.limelight.preferences.PreferenceConfiguration;
 import org.bouncycastle.util.encoders.Hex;
 import org.jspecify.annotations.NonNull;
 
+import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.*;
-import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import static android.bluetooth.BluetoothDevice.TRANSPORT_LE;
-import static android.util.Log.VERBOSE;
 
 /**
  * The methods in this class are inspired by SDL's Steam Controller HID device:
@@ -43,6 +43,8 @@ import static android.util.Log.VERBOSE;
 public class SteamController extends AbstractController {
 
     private static final String TAG = "steamcontroller";
+
+    private static final int REPORT_SIZE = 19;
 
     private static final int BLEButtonChunk1 = 0x10;
     private static final int BLEButtonChunk2 = 0x20;
@@ -63,6 +65,7 @@ public class SteamController extends AbstractController {
     private static final byte SETTING_RPAD_MARGIN = (byte)0x18;
     private static final byte SETTING_LED_USER_BRIGHTNESS = (byte)0x2D;
     private static final byte SETTING_GYRO_MODE = (byte)0x30;
+    private static final byte SETTING_HAPTICS_ENABLED = (byte)0x46;
 
     private static final short TRACKPAD_MODE_NONE = 0x07;
 
@@ -70,6 +73,8 @@ public class SteamController extends AbstractController {
     private static final float ACCEL_RES_PER_G = 16_384.0f;
     // Gyroscope has 16 bit resolution and a range of +/- 2000 dps
     private static final float GYRO_RES_PER_DPS = 16.0f;
+    // Scale right trackpad values 1:2 like in Steam Input "Stick" mode for better reactivity and smaller movements
+    private static final double RIGHT_TRACKPAD_SCALE_FACTOR = 2.0f;
 
     // Valve Corporation
     private static final int VALVE_USB_VID = 0x28DE;
@@ -81,8 +86,11 @@ public class SteamController extends AbstractController {
 
     private final Callback mCallback;
 
+    private final InputState inputState = new InputState();
     private int lastReportId;
-    private final List<ByteBuffer> reassembledReport = new LinkedList<>();
+    // By default, reserve space for two whole reports, which covers the majority of cases without resizing
+    // We keep one single byte array for the lifetime of this controller, so resizing occurs even rarer over time
+    private final ByteArrayOutputStream reassembledReport = new ByteArrayOutputStream(REPORT_SIZE * 2);
 
     public SteamController(ControllerDriverListener listener, BluetoothDriverService manager, int deviceId,
                            BluetoothDevice device, PreferenceConfiguration.SteamControllerEmulation emulationMode) {
@@ -138,10 +146,8 @@ public class SteamController extends AbstractController {
         if (reportId == FEATURE_REPORT_ID_FRAGMENT_START) {
             resetReportFragmentation();
             lastReportId = reportId;
-            ByteBuffer reportFragment = ByteBuffer.allocate(buffer.capacity()).order(ByteOrder.LITTLE_ENDIAN);
-            reportFragment.put((byte)FEATURE_REPORT_ID);
-            reportFragment.put(buffer);
-            reassembledReport.add(reportFragment);
+            reassembledReport.write((byte)FEATURE_REPORT_ID);
+            addReportFragment(buffer);
             return;
         }
 
@@ -152,21 +158,10 @@ public class SteamController extends AbstractController {
         }
 
         lastReportId = reportId;
-        ByteBuffer reportFragment = ByteBuffer.allocate(buffer.remaining()).order(ByteOrder.LITTLE_ENDIAN);
-        reportFragment.put(buffer);
-        reassembledReport.add(reportFragment);
+        addReportFragment(buffer);
 
         if (reportId == FEATURE_REPORT_ID_FRAGMENT_END) {
-            int totalSize = 0;
-            for (ByteBuffer fragment : reassembledReport) {
-                totalSize += fragment.capacity();
-            }
-            ByteBuffer fullReport = ByteBuffer.allocate(totalSize).order(ByteOrder.LITTLE_ENDIAN);
-            for (ByteBuffer fragment : reassembledReport) {
-                fragment.rewind();
-                fullReport.put(fragment);
-            }
-            fullReport.rewind();
+            ByteBuffer fullReport = ByteBuffer.wrap(reassembledReport.toByteArray());
             handleRead(fullReport);
             resetReportFragmentation();
         }
@@ -174,14 +169,33 @@ public class SteamController extends AbstractController {
 
     private void resetReportFragmentation() {
         lastReportId = 0;
-        reassembledReport.clear();
+        reassembledReport.reset();
+    }
+
+    private void addReportFragment(ByteBuffer fragment) {
+        if (fragment.hasArray()) {
+            reassembledReport.write(fragment.array(), fragment.arrayOffset() + fragment.position(), fragment.remaining());
+        } else {
+            byte[] temp = new byte[fragment.remaining()];
+            fragment.get(temp);
+            try {
+                reassembledReport.write(temp);
+            } catch (IOException e) {
+                LimeLog.severe("Failed to write report fragment to reassembled report");
+                resetReportFragmentation();
+            }
+        }
     }
 
     private void handleIdleEvent(ByteBuffer buffer) {
+        if (!Log.isLoggable(TAG, Log.DEBUG)) {
+            // This is a special keep-alive report that should normally be empty
+            return;
+        }
+
         byte[] payload = new byte[buffer.remaining()];
         buffer.get(payload);
 
-        // This is a special keep-alive report that should be otherwise empty, but check just in case.
         long sum = 0;
         for (byte imuDatum : payload) {
             sum += Byte.toUnsignedInt(imuDatum);
@@ -189,17 +203,16 @@ public class SteamController extends AbstractController {
         if (sum != 0) {
             Log.d(TAG, "Received non-empty keep-alive report, ignoring. Payload: " + Arrays.toString(payload));
         }
-
     }
 
     private void handleBatteryEvent(int type, ByteBuffer buffer) {
-        if ((type >> 8) != 0x55) {
+        if ((type >> 8) != 0x55 && Log.isLoggable(TAG, Log.DEBUG)) {
             Log.d(TAG, "Unknown battery report type: " + Integer.toHexString(type));
             return;
         }
 
         buffer.get();   // Skip (unknown) status flags
-        long sequenceNumber = Integer.toUnsignedLong(buffer.getInt());    // Skip sequence number
+        buffer.getInt();    // Skip sequence number
         long alwaysZero = Integer.toUnsignedLong(buffer.getInt());
         if (alwaysZero != 0) {
             Log.d(TAG, "Received battery report with non-zero reserved field (was " + alwaysZero + "), this is unusual.");
@@ -208,12 +221,14 @@ public class SteamController extends AbstractController {
         int voltage = Short.toUnsignedInt(buffer.getShort());   // Voltage in mV
         // Estimate 3.3V .. 100%, 2.5V .. 0%: https://batteryskills.com/aa-battery-voltage-chart/
         byte percentage = (byte)Math.max(Math.min(100, ((voltage - 2500.0) / (3300.0 - 2500.0)) * 100.0), 0);
-        //Log.v(TAG, "Battery report " + sequenceNumber + ": " + voltage + "mV, " + percentage + "%");
+        //Log.v(TAG, "Battery report: " + voltage + "mV, " + percentage + "%");
         reportBatteryState(MoonBridge.LI_BATTERY_STATE_DISCHARGING, percentage);
     }
 
     private void handleInputEvent(int type, ByteBuffer buffer) {
         boolean inputReceived = false;
+        boolean buttonsReceived = false;
+        boolean rpadTouched = false;
         if((type & BLEButtonChunk1) != 0) {
             byte[] buttons = new byte[3];
             buffer.get(buttons);
@@ -251,13 +266,14 @@ public class SteamController extends AbstractController {
             setButtonFlag(ControllerPacket.PADDLE1_FLAG, (int) (b & 0x00010000));
             setButtonFlag(ControllerPacket.TOUCHPAD_FLAG, (int) (b & 0x00020000));*/
 
-            Log.d(TAG, "Buttons: " + Long.toBinaryString(b));
+            rpadTouched = (b & 0x100000) != 0;
             inputReceived = true;
+            buttonsReceived = true;
         }
         if((type & BLEButtonChunk2) != 0) {
             int left = Byte.toUnsignedInt(buffer.get());
             int right = Byte.toUnsignedInt(buffer.get());
-            Log.d(TAG, "Triggers: " + left + " | " + right);
+            //Log.d(TAG, "Triggers: " + left + " | " + right);
             leftTrigger = left / 255.0f;
             rightTrigger = right / 255.0f;
 
@@ -272,7 +288,7 @@ public class SteamController extends AbstractController {
         if((type & BLELeftJoystickChunk) != 0) {
             int x = buffer.getShort();
             int y = ~buffer.getShort();
-            Log.d(TAG, "Joystick: " + x + " | " + y);
+            //Log.d(TAG, "Joystick: " + x + " | " + y);
             leftStickX = x / (float)Short.MAX_VALUE;
             leftStickY = y / (float)Short.MAX_VALUE;
 
@@ -282,22 +298,43 @@ public class SteamController extends AbstractController {
             int x = buffer.getShort();
             int y = ~buffer.getShort();
 
-            Log.v(TAG, "IGNORED Left Trackpad: " + x + " | " + y);
+            //Log.v(TAG, "IGNORED Left Trackpad: " + x + " | " + y);
             inputReceived = true;
         }
         if((type & BLERightTrackpadChunk) != 0) {
-            int x = buffer.getShort();
-            int y = ~buffer.getShort();
-            Log.d(TAG, "Right Pad: " + x + " | " + y);
-            rightStickX = x / (float) Short.MAX_VALUE;
-            rightStickY = y / (float) Short.MAX_VALUE;
+            handleRightTrackpadEvent(buffer, rpadTouched);
 
             inputReceived = true;
         }
 
+        if (buttonsReceived) {
+            inputState.rpadTouched = rpadTouched;
+        }
         if (inputReceived) {
             reportInput();
         }
+    }
+
+    private void handleRightTrackpadEvent(ByteBuffer buffer, boolean rpadTouched) {
+        int x = buffer.getShort();
+        int y = ~buffer.getShort();
+
+        // Adaptive Centering: Set zero point of right trackpad to current position when the pad is touched
+        if (!inputState.rpadTouched && rpadTouched) {
+            inputState.rpadInitialX = x;
+            inputState.rpadInitialY = y;
+        } else if (!rpadTouched) {
+            inputState.rpadInitialX = 0;
+            inputState.rpadInitialY = 0;
+        }
+
+        x = x - inputState.rpadInitialX;
+        y = y - inputState.rpadInitialY;
+        x = Math.max(Short.MIN_VALUE, Math.min((int)(x * RIGHT_TRACKPAD_SCALE_FACTOR), Short.MAX_VALUE));
+        y = Math.max(Short.MIN_VALUE, Math.min((int)(y * RIGHT_TRACKPAD_SCALE_FACTOR), Short.MAX_VALUE));
+        //Log.d(TAG, "Right Pad: " + x + " | " + y);
+        rightStickX = x / (float) Short.MAX_VALUE;
+        rightStickY = y / (float) Short.MAX_VALUE;
     }
 
     private void handleGyroEvent(int type, ByteBuffer buffer) {
@@ -378,14 +415,14 @@ public class SteamController extends AbstractController {
     @Override
     @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
     public void rumble(short lowFreqMotor, short highFreqMotor) {
-        Log.d(TAG, "Rumbling: lowFreq=" + lowFreqMotor + ", highFreq=" + highFreqMotor);
+        //Log.d(TAG, "Rumbling: lowFreq=" + lowFreqMotor + ", highFreq=" + highFreqMotor);
         mCallback.rumble(lowFreqMotor, highFreqMotor);
     }
 
     @Override
     @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
     public void rumbleTriggers(short leftTrigger, short rightTrigger) {
-        Log.d(TAG, "Rumbling triggers: leftTrigger=" + leftTrigger + ", rightTrigger=" + rightTrigger);
+        //Log.d(TAG, "Rumbling triggers: leftTrigger=" + leftTrigger + ", rightTrigger=" + rightTrigger);
         mCallback.rumble(leftTrigger, rightTrigger);
     }
 
@@ -648,7 +685,7 @@ public class SteamController extends AbstractController {
             mHandler.post(() -> {
                 synchronized (mOperations) {
                     if (mCurrentOperation == null) {
-                        Log.w(TAG, "Current operation null in executor?");
+                        LimeLog.warning(TAG + ": Current operation null in executor?");
                         return;
                     }
 
@@ -783,6 +820,7 @@ public class SteamController extends AbstractController {
             settingsData.put(SETTING_RPAD_MODE);
             settingsData.putShort(TRACKPAD_MODE_NONE);
             sendReportCommand(ReportCommand.SET_SETTINGS_VALUES, settingsData);
+            setHapticsState(true);
         }
 
         @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
@@ -791,6 +829,15 @@ public class SteamController extends AbstractController {
             sendReportCommand(ReportCommand.SET_DEFAULT_DIGITAL_MAPPINGS, null);
             // Reset settings
             sendReportCommand(ReportCommand.LOAD_DEFAULT_SETTINGS, null);
+            setHapticsState(true);
+        }
+
+        @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
+        private void setHapticsState(boolean enabled) {
+            ByteBuffer settingsData = ByteBuffer.allocate(3).order(ByteOrder.LITTLE_ENDIAN);
+            settingsData.put(SETTING_HAPTICS_ENABLED);
+            settingsData.putShort((short)(enabled ? 0x01 : 0x00));
+            sendReportCommand(ReportCommand.SET_SETTINGS_VALUES, settingsData);
         }
 
         @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
@@ -823,18 +870,6 @@ public class SteamController extends AbstractController {
 
         @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
         public void rumble(short leftSpeed, short rightSpeed) {
-            // Modeled after the rumble command in Linux's hid-steam driver:
-            // https://github.com/torvalds/linux/blob/master/drivers/hid/hid-steam.c#L514-L555
-            // However, this doesn't seem to work
-            /*ByteBuffer rumbleData = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN)
-                    .put((byte)0)   // Amplitude low byte
-                    .put((byte)0)   // Amplitude high byte
-                    .putShort(leftSpeed)
-                    .putShort(rightSpeed)
-                    .put((byte)2)   // Left gain
-                    .put((byte)0);  // Right gain
-            sendReportCommand(ReportCommand.TRIGGER_RUMBLE, rumbleData);*/
-
             hapticPulse(Trigger.LEFT, leftSpeed, (byte) 2);
             hapticPulse(Trigger.RIGHT, rightSpeed, (byte) 0);
         }
@@ -854,7 +889,7 @@ public class SteamController extends AbstractController {
                     .putShort(offTime) // Time off in µs
                     .putShort(pulses)   // Number of pulses
                     .put(gain);  // Gain in decibels, ranging from -24 to +6
-            Log.v(TAG, "Rumbling trigger " + trigger + ": onTime=" + onTime + "µs, offTime=" + offTime + "µs");
+            //Log.v(TAG, "Rumbling trigger " + trigger + ": onTime=" + onTime + "µs, offTime=" + offTime + "µs");
             sendReportCommand(ReportCommand.TRIGGER_HAPTIC_PULSE, rumbleData);
         }
 
@@ -1055,6 +1090,12 @@ public class SteamController extends AbstractController {
         static public GattOperation enableNotification(BluetoothGatt gatt, UUID uuid) {
             return new GattOperation(gatt, Operation.ENABLE_NOTIFICATION, uuid);
         }
+    }
+
+    private static class InputState {
+        private boolean rpadTouched = false;
+        private int rpadInitialX = 0;
+        private int rpadInitialY = 0;
     }
 
     private enum ReportCommand {
