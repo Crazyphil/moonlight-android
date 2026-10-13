@@ -105,14 +105,6 @@ public class BluetoothDriverService extends Service {
         if (mIsChromebook) {
             mHandler = new Handler(Looper.getMainLooper());
             mLastBluetoothDevices = new ArrayList<>();
-
-            // final HIDDeviceManager finalThis = this;
-            // mHandler.postDelayed(new Runnable() {
-            //     @Override
-            //     public void run() {
-            //         finalThis.chromebookConnectionHandler();
-            //     }
-            // }, 5000);
         }
     }
 
